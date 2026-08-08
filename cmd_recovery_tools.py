@@ -131,16 +131,13 @@ class CMDRecoverySuite:
         input("\nPress Enter to return...")
     @classmethod
     def handle_partition_scan(cls, mode):
-        cls.display_banner(f"{mode} Heuristic Partition Scan")
+        cls.display_banner(f"{mode} Heuristic Partition Scan & Rebuild Engine")
         img_path = input("📂 Enter path to the target image file to carve: ").strip('"')
         if not os.path.exists(img_path):
             print("❌ Error: Target file cannot be located.")
             input("\nPress Enter to return...")
             return
 
-        print("\n🔍 Activating Heuristic Sector-Scanning Grid Engines...")
-        print("🔍 Searching for structural filesystem signatures at 256-byte boundaries...")
-        
         try:
             with open(img_path, "rb") as f:
                 file_bytes = f.read()
@@ -151,79 +148,207 @@ class CMDRecoverySuite:
 
         file_len = len(file_bytes)
         discovered_partitions = []
+        
+        if mode == "D2M":   sys_table_offset = 0x190800
+        elif mode == "D4M": sys_table_offset = 0x320800
+        else:               sys_table_offset = 0x00
 
-        for current_offset in range(0, file_len - 256, 256):
-            sector = file_bytes[current_offset : current_offset + 256]
-            
-            if current_offset + 512 < file_len:
-                bam_sec1 = file_bytes[current_offset + 256 : current_offset + 512]
-                if sector[0] == 40 and sector[1] == 3 and sector[2] == 0x44:
-                    if bam_sec1[0] == 0x00 and bam_sec1[1] == 0xFF and bam_sec1[2] == 0x44:
-                        discovered_partitions.append({
-                            "type": "1581 Emulation (D81)",
-                            "byte_start": current_offset - (39 * 40 * 256),
-                            "block_start": (current_offset - (39 * 40 * 256)) // 512
-                        })
-                        continue
+        print("\n🔬 Activating Deep-Probing 256-Byte Sector Scanning Grid Engines...")
+        print("🔎 Scanning every single 256-byte sector boundary for unaligned signatures...")
 
-            if sector[0] == 18 and sector[1] == 1 and sector[2] == 0x41:
-                base_1541_offset = current_offset - (17 * 21 * 256)
-                is_1571 = False
-                ext_bam_track_offset = base_1541_offset + (34 * 256 * 21) + (18 * 256)
-                if ext_bam_track_offset + 256 <= file_len:
-                    ext_bam_sector = file_bytes[ext_bam_track_offset : ext_bam_track_offset + 256]
-                    if ext_bam_sector[0] == 0x00 and ext_bam_sector[1] == 0xFF:
-                        is_1571 = True
+        # FIXED ALIGNMENT PHYSICS: We step explicitly by 256 bytes to catch signatures no matter which half of a block they sit in!
+        for sector_idx in range(0, file_len // 256):
+            offset = sector_idx * 256
+            if offset + 256 > file_len:
+                break
 
-                p_label = "1571 Emulation (D71)" if is_1571 else "1541 Emulation (D64)"
-                discovered_partitions.append({
-                    "type": p_label,
-                    "byte_start": max(0, base_1541_offset),
-                    "block_start": max(0, base_1541_offset) // 512
-                })
-                continue
+            sector = file_bytes[offset : offset + 256]
 
-            if current_offset + 512 < file_len:
-                nat_bam = file_bytes[current_offset + 256 : current_offset + 512]
-                if sector[2] == 0x48 and nat_bam[0] == 0x00 and nat_bam[1] == 0xFF and nat_bam[2] == 0x48:
+            # --- HEURISTIC PROBE 1: 1581 FORMAT BOUNDARIES MAP ---
+            # A 1581 Directory Header sits at T40 S0. It links forward to Track 40, Sector 3 (sector[0]=40, sector[1]=3).
+            # Byte 2 holds the master character code 'D' (0x44). 
+            # FIXED: Corrected the layout signature validation to target indices 25 and 26 natively!
+            if sector[0] == 40 and sector[1] == 3 and sector[2] == 0x44:
+                if sector[25] == 0x33 and sector[26] == 0x44: # Confirms ASCII "3D" at positions 25 and 26
+                    # 1581 headers sit at Track 40, Sector 0. To calculate the base of Track 1, Sector 0:
+                    # Step back exactly 39 tracks * 40 sectors/track = 1560 sectors allocation footprint
+                    p_start_sector = sector_idx - 1560
+                    p_start_bytes = p_start_sector * 256
+                    p_start_block = p_start_bytes // 512
+
+                    # Extract disk name label out of the Track 40 header record string offsets safely
+                    name_bytes = sector[4 : 20] # Standard 16-byte name field shift window offset
+                    p_name = "".join([chr(b) for b in name_bytes if 32 <= b <= 126 or b == 0xA0]).replace(chr(0xA0), " ").strip()
+                    if not p_name: p_name = "1581 RECOVERED"
+
                     discovered_partitions.append({
-                        "type": "CMD Native Partition (DNP)",
-                        "byte_start": current_offset,
-                        "block_start": current_offset // 512
+                        "type_flag": 0x04, "type_str": "81 (1581 Mode)", "name": p_name,
+                        "block_start": p_start_block, "byte_start": p_start_block * 512, "default_blocks": 1600
+                    })
+                    continue
+
+
+            # --- HEURISTIC PROBE 2: 1541 / 1571 DIRECTORY BAM SECTORS ---
+            # Standard CBM BAM sits at Track 18, Sector 0. Byte 0=18, Byte 1=1, Byte 2='A' (0x41)
+            elif sector[0] == 18 and sector[1] == 1 and sector[2] == 0x41:
+                # Step back 17 tracks * 21 sectors/track = 357 sectors to hit Track 1, Sector 0
+                p_start_sector = sector_idx - 357
+                p_start_bytes = p_start_sector * 256
+                p_start_block = p_start_bytes // 512
+
+                # Extract partition name label safely out of the Track 18 header string offsets
+                name_bytes = sector[144 : 160]
+                p_name = "".join([chr(b) for b in name_bytes if 32 <= b <= 126 or b == 0xA0]).replace(chr(0xA0), " ").strip()
+                if not p_name: p_name = "RECOVERED CBM"
+
+                # --- HARDWARE INTEGRITY EXTRACTION PASS ---
+                # Inspect Byte 3 of the BAM sector: 0x80 explicitly flags a 1571 double-sided format!
+                if sector[3] == 0x80:
+                    is_1571 = True
+                else:
+                    # Fallback verification step: check if side-2 BAM records exist at relative track 53
+                    is_1571 = False
+                    lookahead_1571_offset = (p_start_block * 512) + (34 * 256 * 21) + (18 * 256)
+                    if lookahead_1571_offset + 256 <= file_len:
+                        ext_bam = file_bytes[lookahead_1571_offset : lookahead_1571_offset + 256]
+                        if ext_bam[0] == 0x00 and ext_bam[1] == 0xFF:
+                            is_1571 = True
+
+                t_code = 0x03 if is_1571 else 0x02
+                t_label = "71 (1571 Mode)" if is_1571 else "41 (1541 Mode)"
+                t_blocks = 684 if is_1571 else 342
+
+                discovered_partitions.append({
+                    "type_flag": t_code, "type_str": t_label, "name": p_name,
+                    "block_start": p_start_block, "byte_start": p_start_block * 512, "default_blocks": t_blocks
+                })
+
+
+            # --- HEURISTIC PROBE 3: CMD NATIVE PARTITION (NAT) ---
+            # --- HEURISTIC PROBE 3: CMD NATIVE PARTITION (NAT) ---
+            # A DNP Native Directory Header sits at Track 1, Sector 1.
+            # FIXED: Validated against your physical screen dump parameters:
+            # 1) Link Track byte must be Track 1 (0x01)
+            # 2) Offset 2 must hold the character 'H' (0x48)
+            # 3) Offsets 25 and 26 must hold the exact "$31 $48" ("1H") DOS layout ID signature string!
+            elif sector[0] == 1 and sector[2] == 0x48:
+                if sector[25] == 0x31 and sector[26] == 0x48:
+                    # Because T1 S1 is exactly 1 sector deep from the absolute partition boundary base (Track 1, Sector 0),
+                    # we step back precisely 1 sector (256 bytes) to calculate the true starting LBA block!
+                    p_start_sector = sector_idx - 1
+                    p_start_bytes = p_start_sector * 256
+                    p_start_block = p_start_bytes // 512
+
+                    # Extract disk name label out of the Track 1, Sector 1 directory header field offsets safely
+                    name_bytes = sector[4 : 20] # Standard 16-character volume label slice
+                    p_name = "".join([chr(b) for b in name_bytes if 32 <= b <= 126 or b == 0xA0]).replace(chr(0xA0), " ").strip()
+                    if not p_name: p_name = "NAT RECOVERED"
+
+                    discovered_partitions.append({
+                        "type_flag": 0x01, "type_str": "NAT (Native Mode)", "name": p_name,
+                        "block_start": p_start_block, "byte_start": p_start_block * 512, "default_blocks": 0
                     })
 
-        print("\n" + "=" * 80)
-        print("🏆 HEURISTIC CARVER SCANNING RECOVERY SUMMARY")
-        print("=" * 80)
-        if not discovered_partitions:
-            print("⚠️  No standalone filesystem sector signature signatures discovered.")
-        else:
-            discovered_partitions.sort(key=lambda x: x["byte_start"])
-            unique_nodes = []
-            seen_offsets = set()
-            for node in discovered_partitions:
-                rounded_start = (node["byte_start"] // 512) * 512
-                if rounded_start not in seen_offsets:
-                    seen_offsets.add(rounded_start)
-                    node["byte_start"] = rounded_start
-                    node["block_start"] = rounded_start // 512
-                    unique_nodes.append(node)
 
-            for idx, part in enumerate(unique_nodes):
-                if idx < len(unique_nodes) - 1:
-                    calculated_len_bytes = unique_nodes[idx+1]["byte_start"] - part["byte_start"]
-                else:
-                    calculated_len_bytes = file_len - part["byte_start"]
+        # Process, clean up duplicates, and sort final records
+        discovered_partitions.sort(key=lambda x: x["block_start"])
+        unique_nodes = []
+        seen_blocks = set()
+        for node in discovered_partitions:
+            if node["block_start"] not in seen_blocks and node["block_start"] >= 0:
+                seen_blocks.add(node["block_start"])
+                unique_nodes.append(node)
 
-                calculated_blocks = calculated_len_bytes // 512
+        print("\n" + "=" * 90)
+        print("🏆 COMPREHENSIVE FORENSIC RECOVERY SUMMARY & CROSS-REFERENCE REPORT")
+        print("=" * 90)
+        if not unique_nodes:
+            print("⚠️  No working filesystem track markers isolated during this scan pass.")
+            input("\nPress Enter to return...")
+            return
+
+        # COLLISION PROCESSING ENGINE: Dynamically balance block allocations based on the next neighbor
+        for idx, part in enumerate(unique_nodes):
+            if idx < len(unique_nodes) - 1:
+                calc_len_bytes = unique_nodes[idx+1]["byte_start"] - part["byte_start"]
+            else:
+                calc_len_bytes = file_len - part["byte_start"]
                 
-                print(f" Discovered Volume Entry #{idx+1:02d}:")
-                print(f"  ├── Partition Profile Model : {part['type']}")
-                print(f"  ├── Base LBA Block Pointer  : {part['block_start']} (Hex Absolute Offset: 0x{part['byte_start']:06X})")
-                print(f"  └── Calculated Blocks Span  : {calculated_blocks} Blocks ({calculated_len_bytes} Bytes) [BEST GUESS MAP]")
-                print("-" * 80)
+            calc_blocks_size = calc_len_bytes // 512
+            # For rigid emulation formats, enforce their physical hardware constraint caps
+            if part["default_blocks"] > 0:
+                part["blocks_count"] = part["default_blocks"]
+            else:
+                part["blocks_count"] = calc_blocks_size
+
+            print(f" [+] Discovered Partition Index Slot #{idx+1:02d}:")
+            print(f"  ├── Volume Name Label : \"{part['name']}\"")
+            print(f"  ├── Drive Core Type   : {part['type_str']}")
+            print(f"  ├── Base LBA Block    : {part['block_start']} (Absolute Byte Address: {part['byte_start']} | Hex: 0x{part['byte_start']:06X})")
+            print(f"  └── Table Span Size   : {part['blocks_count']} Blocks (Total Length Footprint: {part['blocks_count'] * 512} Bytes)")
+            print("-" * 90)
+
+        # --- THE ACTIVE RECOVERY TABLE FLASHER REPAIR PASS ---
+        print(f"\n⚠️  CRITICAL ACTION: Found {len(unique_nodes)} volumes available for recovery mapping.")
+        ans = input("📥 Recreate and flash a fresh partition table back onto the file container? (Y/N): ").strip().upper()
+        if ans == "Y":
+            if mode == "DHD" and sys_table_offset == 0:
+                print("❌ Aborting: Cannot write back to a DHD unless its master configuration block is active.")
+                input("\nPress Enter to return...")
+                return
+
+            # Compile a fresh, sterile 1024-byte table block initialized with binary null primitives
+            rebuilt_table_buffer = bytearray(1024)
+            
+            # Map out Slot 0 as your rigid hardware SYSTEM Configuration Block
+            rebuilt_table_buffer[2] = 0xFF # Type SYSTEM
+            # Pad filename field index rows with unshifted spaces (0xA0) up to 16 characters
+            rebuilt_table_buffer[5:21] = b"SYSTEM".ljust(16, b"\xA0")
+            # Set System track starting position matching hardware offsets
+            sys_start_lba = sys_table_offset // 512
+            rebuilt_table_buffer[21] = (sys_start_lba >> 16) & 0xFF
+            rebuilt_table_buffer[22] = (sys_start_lba >> 8) & 0xFF
+            rebuilt_table_buffer[23] = sys_start_lba & 0xFF
+            rebuilt_table_buffer[29] = 0
+            rebuilt_table_buffer[30] = 0
+            rebuilt_table_buffer[31] = 12 # Standard 12-block configuration tracking width width
+            
+            # Loop sequentially and write your recovered entry nodes into slots 1 through 31
+            for idx, part in enumerate(unique_nodes[:31]):
+                slot_offset = (idx + 1) * 32
+                
+                rebuilt_table_buffer[slot_offset] = 0x00 # Next link tracking track pointer
+                rebuilt_table_buffer[slot_offset + 1] = 0x00 # Next link sector pointer
+                rebuilt_table_buffer[slot_offset + 2] = part["type_flag"] # Inject type integer
+                
+                # Format name label safely to PETSCII space-padded bytes
+                clean_petscii_name = part["name"].upper().encode('ascii', errors='ignore')[:16].ljust(16, b"\xA0")
+                rebuilt_table_buffer[slot_offset + 5 : slot_offset + 21] = clean_petscii_name
+                
+                # Inject 24-bit Big-Endian Location Block into bytes 21, 22, 23
+                loc_lba = part["block_start"]
+                rebuilt_table_buffer[slot_offset + 21] = (loc_lba >> 16) & 0xFF
+                rebuilt_table_buffer[slot_offset + 22] = (loc_lba >> 8) & 0xFF
+                rebuilt_table_buffer[slot_offset + 23] = loc_lba & 0xFF
+                
+                # Inject 24-bit Big-Endian Size Blocks Count into final trailing bytes 29, 30, 31
+                sz_blocks = part["blocks_count"]
+                rebuilt_table_buffer[slot_offset + 29] = (sz_blocks >> 16) & 0xFF
+                rebuilt_table_buffer[slot_offset + 30] = (sz_blocks >> 8) & 0xFF
+                rebuilt_table_buffer[slot_offset + 31] = sz_blocks & 0xFF
+
+            try:
+                # Open up the real file handle on your desktop and overwrite the exact table offset bytes!
+                with open(img_path, "r+b") as f_disk:
+                    f_disk.seek(sys_table_offset)
+                    f_disk.write(rebuilt_table_buffer)
+                print(f"\n🏆 REPAIR COMPLETE: Re-serialized {len(unique_nodes)} partition slot maps straight down to disk!")
+                print(f"🏆 Flashed 1024-byte table sector grid to address 0x{sys_table_offset:X} successfully. Mount it now!")
+            except Exception as file_err:
+                print(f"❌ Error writing table changes back to your local PC storage: {file_err}")
 
         input("\nPress Enter to return...")
+
     @classmethod
     def handle_dnp_carver_menu(cls):
         cls.display_banner("DNP Standalone Deep Carver Engine")
