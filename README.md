@@ -11,4 +11,6 @@ Features:
   and Native partitions, and then over-write the partition table with the partitions
   that were successfully located.
 
+  Added an option to extract all partitions located to the appropriate disk image type.
+  
   Also a scanner for DNP images to attempt to locate missing files and subdirectories.
